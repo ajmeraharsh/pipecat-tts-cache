@@ -869,3 +869,100 @@ async def test_replayed_audio_reaches_the_transport_inside_a_reused_turn_context
 
     assert "bravo" in spoken, "the cached sentence was never spoken"
     assert spoken == ["alpha", "bravo"], f"sentences spoken out of order: {spoken}"
+
+
+class SelfBracketingTTS(TTSService):
+    """A service that opens its own audio context and TTFB clock inside ``run_tts``.
+
+    Faithful to ElevenLabs, Deepgram, Inworld, NVIDIA, ResembleAI and Rime: they pass
+    ``push_start_frame=False`` because they emit their own ``TTSStartedFrame``, which makes
+    ``TTSService._push_tts_frames`` skip the bracket it normally does before ``run_tts``.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(
+            push_start_frame=False,
+            push_stop_frames=False,
+            push_text_frames=False,
+            sample_rate=_SAMPLE_RATE,
+            **kwargs,
+        )
+        self._settings = TTSSettings(voice="test-voice", model="test-model", language=None)
+        self.run_tts_calls = 0
+        self.ttfb_events: list[str] = []
+
+    def can_generate_metrics(self) -> bool:
+        return True
+
+    async def start_ttfb_metrics(self):
+        self.ttfb_events.append("start")
+        await super().start_ttfb_metrics()
+
+    async def stop_ttfb_metrics(self):
+        self.ttfb_events.append("stop")
+        await super().stop_ttfb_metrics()
+
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        self.run_tts_calls += 1
+        if not self.audio_context_available(context_id):
+            await self.create_audio_context(context_id)
+            await self.start_ttfb_metrics()
+            yield TTSStartedFrame(context_id=context_id)
+
+        async def _deliver():
+            await asyncio.sleep(0.2)
+            await self.append_to_audio_context(
+                context_id,
+                TTSAudioRawFrame(
+                    audio=_AUDIO,
+                    sample_rate=_SAMPLE_RATE,
+                    num_channels=1,
+                    context_id=context_id,
+                ),
+            )
+            await self.append_to_audio_context(context_id, TTSStoppedFrame(context_id=context_id))
+            await self.remove_audio_context(context_id)
+
+        self.create_task(_deliver(), name=f"deliver_{context_id}")
+
+
+class CachedSelfBracketingTTS(TTSCacheMixin, SelfBracketingTTS):
+    pass
+
+
+async def test_cache_hit_reports_ttfb_for_a_self_bracketing_service():
+    """A replayed response must still open a context and start the TTFB clock.
+
+    Services that pass ``push_start_frame=False`` do that work inside their own ``run_tts``,
+    which a cache hit never reaches. Without the mixin standing in, the clock is stopped
+    having never started (so no TTFB is reported at all) and the replayed audio is appended
+    to a context nobody opened, which the framework papers over by recreating it.
+    """
+    backend = MemoryCacheBackend()
+    tts = CachedSelfBracketingTTS(cache_backend=backend)
+
+    await run_test(
+        tts,
+        frames_to_send=[
+            TTSSpeakFrame(text="hello world", append_to_context=False),
+            SleepFrame(sleep=0.6),
+        ],
+    )
+    assert tts.ttfb_events == ["start", "stop"], "baseline miss should bracket normally"
+
+    tts.ttfb_events.clear()
+    calls_before = tts.run_tts_calls
+    down, _ = await run_test(
+        tts,
+        frames_to_send=[
+            TTSSpeakFrame(text="hello world", append_to_context=False),
+            SleepFrame(sleep=0.6),
+        ],
+    )
+
+    assert tts.run_tts_calls == calls_before, "the hit should not reach the provider"
+    assert [f for f in down if isinstance(f, TTSAudioRawFrame)], "replayed audio never arrived"
+    assert tts.ttfb_events == ["start", "stop"], (
+        f"TTFB was not bracketed on the cache hit: {tts.ttfb_events} — a lone 'stop' means "
+        "the clock was never started, so no TTFB is reported for replayed speech"
+    )

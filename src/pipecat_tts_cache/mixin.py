@@ -25,6 +25,7 @@ from pipecat.frames.frames import (
     Frame,
     InterruptionFrame,
     TTSAudioRawFrame,
+    TTSStartedFrame,
     TTSStoppedFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
@@ -213,8 +214,22 @@ class TTSCacheMixin:
         ``TTSTextFrame``s (transcript / word alignment) before the audio, mirroring how
         a word-timestamp-capable service behaves live. Audio frames are stamped with the
         active ``context_id`` and tagged as cache-origin so they are not re-captured.
-        Start/stop framing is left to the base class, which brackets every audio context.
+
+        The audio context and the TTFB clock are opened here when the wrapped service has
+        not already done so. Some services (the base ``TTSService``) bracket every request
+        in ``_push_tts_frames`` before ``run_tts`` is reached, but others — ElevenLabs over
+        websockets among them — call ``create_audio_context`` and ``start_ttfb_metrics``
+        from inside their own ``run_tts``. A cache hit returns before that code runs, so
+        without this the context is missing (the framework logs "recreating audio context")
+        and TTFB/TTFA are never reported for replayed speech.
         """
+        if not self.audio_context_available(context_id):
+            await self.create_audio_context(context_id)
+            # Only meaningful once a context exists: the framework stops this clock when the
+            # first audio frame drains from that context, which for a hit is immediate.
+            await self.start_ttfb_metrics()
+            await self.push_frame(TTSStartedFrame(context_id=context_id))
+
         if cached.word_timestamps:
             word_times = [(wt.word, wt.timestamp) for wt in cached.word_timestamps]
             if hasattr(super(), "add_word_timestamps"):
