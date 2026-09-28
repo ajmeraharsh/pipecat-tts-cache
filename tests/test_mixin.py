@@ -15,10 +15,15 @@ cache or the framework. The fakes mirror the two real delivery models:
 """
 
 import asyncio
+
+import pytest
 from collections.abc import AsyncGenerator
 
 from pipecat.frames.frames import (
     Frame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    TextFrame,
     InterruptionFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
@@ -354,52 +359,6 @@ async def test_backend_failure_never_breaks_synthesis():
     assert len(audio) == 1  # audio still reached the transport despite set() raising
 
 
-async def test_multi_sentence_context_splits_audio_by_word_boundaries():
-    """When one audio context holds several sentences (a reused turn context), the audio is
-    split at word boundaries and each sentence is cached independently.
-
-    Driven at the finalize boundary rather than through the pipeline: reproducing this
-    faithfully needs a provider that emits turn-cumulative, monotonic word timestamps, which
-    is awkward and brittle to fake end-to-end. Constructing the captured context directly
-    keeps the split algorithm's assertion deterministic.
-    """
-    from pipecat_tts_cache.mixin import _ContextCapture, _PendingTask
-    from pipecat_tts_cache.models import CachedAudioChunk
-
-    backend = MemoryCacheBackend()
-    tts = CachedHttpTTS(cache_backend=backend)
-
-    channels = 1
-    bytes_per_sample = 2 * channels
-    quarter = int(0.25 * _SAMPLE_RATE) * bytes_per_sample  # bytes for 0.25s of audio
-    audio = (
-        b"\x11" * quarter + b"\x22" * quarter + b"\x33" * quarter + b"\x44" * quarter
-    )  # 1.0s total
-
-    key1 = tts._generate_cache_key("hello world")
-    key2 = tts._generate_cache_key("foo bar")
-
-    tts._contexts["turn-ctx"] = _ContextCapture(
-        tasks=[
-            _PendingTask(text="hello world", cache_key=key1, word_count=2),
-            _PendingTask(text="foo bar", cache_key=key2, word_count=2),
-        ],
-        audio=[CachedAudioChunk(audio, _SAMPLE_RATE, channels)],
-        word_timestamps=[("hello", 0.0), ("world", 0.25), ("foo", 0.5), ("bar", 0.75)],
-    )
-
-    await tts._finalize_context("turn-ctx")
-
-    entry1 = await backend.get(key1)
-    entry2 = await backend.get(key2)
-    assert entry1 is not None and entry2 is not None
-    # Sentence 1 = the audio before "foo" (0.0–0.5s); sentence 2 = the rest (0.5–1.0s).
-    assert entry1.audio_chunks[0].audio == b"\x11" * quarter + b"\x22" * quarter
-    assert entry2.audio_chunks[0].audio == b"\x33" * quarter + b"\x44" * quarter
-    assert entry1.metadata["text"] == "hello world"
-    assert entry2.metadata["text"] == "foo bar"
-
-
 async def test_object_valued_setting_does_not_break_synthesis():
     """A non-JSON-serializable settings value (like Cartesia's ``GenerationConfig``
     pydantic model) must not break cache-key generation or synthesis (review C1)."""
@@ -467,31 +426,6 @@ async def test_run_tts_failure_clears_context_and_caches_nothing():
     await run_test(tts, frames_to_send=[_speak("hello world")])
 
     assert tts._contexts == {}  # context discarded on failure
-    assert (await backend.get_stats())["size"] == 0
-
-
-async def test_non_monotonic_timestamps_skip_the_split_instead_of_corrupting():
-    """A non-monotonic timestamp sequence skips the multi-sentence split entirely (safe
-    data-loss) rather than mis-attributing a whole turn to one sentence (review H3)."""
-    from pipecat_tts_cache.mixin import _ContextCapture, _PendingTask
-    from pipecat_tts_cache.models import CachedAudioChunk
-
-    backend = MemoryCacheBackend()
-    tts = CachedHttpTTS(cache_backend=backend)
-
-    tts._contexts["turn-ctx"] = _ContextCapture(
-        tasks=[
-            _PendingTask("one two", tts._generate_cache_key("one two"), 2),
-            _PendingTask("three four", tts._generate_cache_key("three four"), 2),
-        ],
-        audio=[CachedAudioChunk(b"\x00\x01" * 1000, _SAMPLE_RATE, 1)],
-        # Word count matches (4), but the 2nd sentence's timestamps reset -> non-monotonic.
-        word_timestamps=[("one", 0.0), ("two", 0.25), ("three", 0.0), ("four", 0.25)],
-    )
-
-    await tts._finalize_context("turn-ctx")
-
-    # Without the guard the last task would absorb the whole turn; with it, nothing is stored.
     assert (await backend.get_stats())["size"] == 0
 
 
@@ -621,3 +555,317 @@ async def test_add_word_timestamps_adapts_to_an_older_base_signature():
         [("hi", 0.0)], context_id="c", includes_inter_frame_spaces=True, pre_merge_tokens=True
     )
     assert received == [([("hi", 0.0)], "c")]
+
+
+
+class FakeTurnTTS(_BaseFakeTTS):
+    """Turn-style provider: one shared context per LLM turn, turn-cumulative word timestamps.
+
+    Mirrors what this caching runs against in production. Each sentence gets its own marker
+    byte and a length proportional to its word count, so audio sliced at the wrong origin
+    shows up as a neighbour's bytes instead of as coincidentally-correct audio.
+    """
+
+    PER_WORD_BYTES = int(0.25 * _SAMPLE_RATE) * 2  # 0.25s of 16-bit mono per word
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._turn_clock = 0.0
+        self._marks: dict[str, bytes] = {}
+
+    def mark_for(self, text: str) -> bytes:
+        if text not in self._marks:
+            self._marks[text] = bytes([0xA0 + len(self._marks)])
+        return self._marks[text]
+
+    async def on_turn_context_created(self, context_id: str):
+        self._turn_clock = 0.0
+        await super().on_turn_context_created(context_id)
+
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        self.run_tts_calls += 1
+        self.synthesized_texts.append(text)
+        words = text.split()
+        word_times = [(w, self._turn_clock + i * 0.25) for i, w in enumerate(words)]
+        self._turn_clock += 0.25 * len(words)
+        await self.add_word_timestamps(word_times, context_id=context_id)
+        yield TTSAudioRawFrame(
+            audio=self.mark_for(text) * (self.PER_WORD_BYTES * len(words)),
+            sample_rate=_SAMPLE_RATE,
+            num_channels=1,
+            context_id=context_id,
+        )
+
+
+class CachedTurnTTS(TTSCacheMixin, FakeTurnTTS):
+    pass
+
+
+def _turn(sentences: list[str]) -> list[Frame]:
+    """One LLM turn: streamed text aggregated into sentences that share one audio context.
+
+    Text must arrive as ``TextFrame`` (the LLM streaming path). ``TTSSpeakFrame`` is
+    explicitly excluded from the turn context by ``TTSService``, so it would give each
+    sentence its own context and never exercise the multi-sentence split.
+    """
+    frames: list[Frame] = [LLMFullResponseStartFrame()]
+    for text in sentences:
+        frames.append(TextFrame(text + ". "))  # trailing period -> aggregator emits a sentence
+    frames.append(LLMFullResponseEndFrame())
+    frames.append(SleepFrame(sleep=0.4))
+    return frames
+
+
+async def _assert_each_sentence_kept_its_own_audio(backend, tts, texts: list[str]) -> None:
+    """Every cached sentence holds only its own audio, at its own full length."""
+    for text in texts:
+        entry = await backend.get(tts._generate_cache_key(text))
+        if entry is None:
+            continue  # a skipped write is safe; contaminated audio is not
+        audio = entry.audio_chunks[0].audio
+        own = tts.mark_for(text)
+        foreign = sorted({bytes([b]).hex() for b in set(audio)} - {own.hex()})
+        assert not foreign, (
+            f"'{text}' was cached carrying another sentence's audio "
+            f"(found {foreign}, expected only {own.hex()})"
+        )
+        expected = tts.PER_WORD_BYTES * len(text.split())
+        assert len(audio) == expected, (
+            f"'{text}' cached {len(audio)} bytes, expected {expected} — "
+            "its slice boundary was taken at the wrong origin"
+        )
+
+
+async def test_turn_leading_cached_sentence_does_not_shift_the_misses():
+    """hit, miss, miss — the leading hit contributes no audio but does consume turn-clock
+    time, which is exactly the offset that used to shift every following slice."""
+    backend = MemoryCacheBackend()
+    tts = CachedTurnTTS(cache_backend=backend)
+
+    await run_test(tts, frames_to_send=_turn(["alpha one"]))  # prime sentence 1
+    await run_test(
+        tts, frames_to_send=_turn(["alpha one", "bravo two three", "charlie four"])
+    )
+
+    await _assert_each_sentence_kept_its_own_audio(
+        backend, tts, ["alpha one", "bravo two three", "charlie four"]
+    )
+
+
+async def test_turn_trailing_cached_sentence():
+    """miss, hit — the trailing hit contributes no bytes; the miss keeps its whole slice."""
+    backend = MemoryCacheBackend()
+    tts = CachedTurnTTS(cache_backend=backend)
+
+    await run_test(tts, frames_to_send=_turn(["bravo two three"]))
+    await run_test(tts, frames_to_send=_turn(["alpha one", "bravo two three"]))
+
+    await _assert_each_sentence_kept_its_own_audio(
+        backend, tts, ["alpha one", "bravo two three"]
+    )
+
+
+async def test_turn_cached_sentence_in_the_middle():
+    """miss, hit, miss — a gap mid-turn, the case no single rebase offset can fix."""
+    backend = MemoryCacheBackend()
+    tts = CachedTurnTTS(cache_backend=backend)
+
+    await run_test(tts, frames_to_send=_turn(["bravo two three"]))
+    await run_test(
+        tts, frames_to_send=_turn(["alpha one", "bravo two three", "charlie four"])
+    )
+
+    await _assert_each_sentence_kept_its_own_audio(
+        backend, tts, ["alpha one", "bravo two three", "charlie four"]
+    )
+
+
+async def test_turn_alternating_hits_and_misses():
+    """hit, miss, hit, miss across four sentences of differing length."""
+    backend = MemoryCacheBackend()
+    tts = CachedTurnTTS(cache_backend=backend)
+
+    await run_test(tts, frames_to_send=_turn(["alpha one"]))
+    await run_test(tts, frames_to_send=_turn(["charlie four five six"]))
+    await run_test(
+        tts,
+        frames_to_send=_turn(
+            ["alpha one", "bravo two three", "charlie four five six", "delta seven"]
+        ),
+    )
+
+    await _assert_each_sentence_kept_its_own_audio(
+        backend,
+        tts,
+        ["alpha one", "bravo two three", "charlie four five six", "delta seven"],
+    )
+
+
+async def test_multi_sentence_turn_stays_uncached_across_repeats():
+    """A multi-sentence turn is never cached, so repeating it re-synthesizes every sentence.
+
+    This is the accepted cost of refusing to guess sentence boundaries. Turns that speak a
+    single text — the canned lines this cache targets — still hit; see
+    ``test_cache_hit_replays_without_resynthesizing``.
+    """
+    backend = MemoryCacheBackend()
+    tts = CachedTurnTTS(cache_backend=backend)
+
+    await run_test(tts, frames_to_send=_turn(["alpha one", "bravo two three"]))
+    assert (await backend.get_stats())["size"] == 0
+
+    calls = tts.run_tts_calls
+    await run_test(tts, frames_to_send=_turn(["alpha one", "bravo two three"]))
+
+    assert tts.run_tts_calls > calls  # nothing was cached, so both sentences run again
+    assert (await backend.get_stats())["size"] == 0
+
+
+async def test_multi_sentence_context_is_not_cached():
+    """A context holding several texts is skipped rather than split.
+
+    Nothing in the frame stream delimits one sentence's audio from the next inside a reused
+    turn context, so any boundary would be an estimate. Skipping costs one re-synthesis; a
+    wrong estimate would replay mis-sliced audio for the whole TTL.
+    """
+    from pipecat_tts_cache.mixin import _ContextCapture, _PendingTask
+    from pipecat_tts_cache.models import CachedAudioChunk
+
+    backend = MemoryCacheBackend()
+    tts = CachedHttpTTS(cache_backend=backend)
+
+    tts._contexts["turn-ctx"] = _ContextCapture(
+        tasks=[
+            _PendingTask("hello world", tts._generate_cache_key("hello world"), 2),
+            _PendingTask("foo bar", tts._generate_cache_key("foo bar"), 2),
+        ],
+        audio=[CachedAudioChunk(b"\x11" * 8000 + b"\x22" * 8000, _SAMPLE_RATE, 1)],
+        word_timestamps=[("hello", 0.0), ("world", 0.25), ("foo", 0.5), ("bar", 0.75)],
+    )
+
+    await tts._finalize_context("turn-ctx")
+
+    assert (await backend.get_stats())["size"] == 0
+
+
+async def test_single_sentence_context_caches_its_exact_audio():
+    """The single-text path stores the captured audio verbatim — no slicing, no estimate.
+
+    This is the path fixed canned lines take, which is what the cache exists for.
+    """
+    from pipecat_tts_cache.mixin import _ContextCapture, _PendingTask
+    from pipecat_tts_cache.models import CachedAudioChunk
+
+    backend = MemoryCacheBackend()
+    tts = CachedHttpTTS(cache_backend=backend)
+
+    key = tts._generate_cache_key("connecting you now")
+    audio = b"\x11" * 12000
+
+    tts._contexts["turn-ctx"] = _ContextCapture(
+        tasks=[_PendingTask("connecting you now", key, 3)],
+        audio=[CachedAudioChunk(audio, _SAMPLE_RATE, 1)],
+        word_timestamps=[("connecting", 0.0), ("you", 0.25), ("now", 0.5)],
+    )
+
+    await tts._finalize_context("turn-ctx")
+
+    entry = await backend.get(key)
+    assert entry is not None
+    assert entry.audio_chunks[0].audio == audio
+    assert [wt.word for wt in (entry.word_timestamps or [])] == ["connecting", "you", "now"]
+
+
+@pytest.mark.parametrize("miss_count", [2, 3, 4, 5], ids=lambda n: f"{n}-texts")
+async def test_any_multi_text_context_is_skipped_regardless_of_layout(miss_count):
+    """No arrangement of texts in one context is cached — the count alone decides.
+
+    Covers the interleavings that motivated this: hits contribute no audio but do advance
+    the provider's turn clock, so a turn like miss,hit,hit,miss leaves a buffer whose gaps
+    no timestamp math can recover. The rule is uniform, so none of those shapes can slip in.
+    """
+    from pipecat_tts_cache.mixin import _ContextCapture, _PendingTask
+    from pipecat_tts_cache.models import CachedAudioChunk
+
+    backend = MemoryCacheBackend()
+    tts = CachedHttpTTS(cache_backend=backend)
+
+    tasks = [
+        _PendingTask(f"sentence {i}", tts._generate_cache_key(f"sentence {i}"), 2)
+        for i in range(miss_count)
+    ]
+    tts._contexts["turn-ctx"] = _ContextCapture(
+        tasks=tasks,
+        audio=[CachedAudioChunk(b"\x33" * (8000 * miss_count), _SAMPLE_RATE, 1)],
+        word_timestamps=[(f"w{i}", i * 0.25) for i in range(2 * miss_count)],
+    )
+
+    await tts._finalize_context("turn-ctx")
+
+    assert (await backend.get_stats())["size"] == 0
+
+
+class SlowWebsocketTTS(_BaseFakeTTS):
+    """Websocket-style provider: audio arrives late, from a background task.
+
+    The realistic shape for ElevenLabs and friends — ``run_tts`` yields nothing and the
+    audio appears on the context queue after a network delay.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._marks: dict[str, bytes] = {}
+
+    def mark_for(self, text: str) -> bytes:
+        if text not in self._marks:
+            self._marks[text] = bytes([0xA0 + len(self._marks)])
+        return self._marks[text]
+
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        self.run_tts_calls += 1
+        self.synthesized_texts.append(text)
+        marker = self.mark_for(text)
+
+        async def _deliver():
+            await asyncio.sleep(0.3)  # network latency
+            await self.append_to_audio_context(
+                context_id,
+                TTSAudioRawFrame(
+                    audio=marker * 3200,
+                    sample_rate=_SAMPLE_RATE,
+                    num_channels=1,
+                    context_id=context_id,
+                ),
+            )
+
+        self.create_task(_deliver(), name=f"deliver_{context_id}")
+        if False:  # make this an async generator that yields nothing
+            yield
+
+
+class CachedSlowWebsocketTTS(TTSCacheMixin, SlowWebsocketTTS):
+    pass
+
+
+async def test_replayed_audio_reaches_the_transport_inside_a_reused_turn_context():
+    """Cached audio must be queued on the open audio context, not yielded from run_tts.
+
+    A websocket service delivers audio by appending to the context queue; ``run_tts`` itself
+    yields nothing. Yielding replayed frames there dropped them entirely inside a reused turn
+    context, so a cached sentence went silent. Queueing also keeps it behind an earlier
+    sentence whose live audio is still in flight, instead of overtaking it.
+    """
+    backend = MemoryCacheBackend()
+    tts = CachedSlowWebsocketTTS(cache_backend=backend)
+
+    await run_test(tts, frames_to_send=_turn(["bravo"]))  # prime "bravo." on its own
+    down, _ = await run_test(tts, frames_to_send=_turn(["alpha", "bravo"]))
+
+    spoken = [
+        {0xA0: "alpha", 0xA1: "bravo"}.get(f.audio[0])
+        for f in down
+        if isinstance(f, TTSAudioRawFrame)
+    ]
+
+    assert "bravo" in spoken, "the cached sentence was never spoken"
+    assert spoken == ["alpha", "bravo"], f"sentences spoken out of order: {spoken}"

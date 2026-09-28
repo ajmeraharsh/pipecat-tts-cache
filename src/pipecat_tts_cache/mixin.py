@@ -220,6 +220,7 @@ class TTSCacheMixin:
             if hasattr(super(), "add_word_timestamps"):
                 await super().add_word_timestamps(word_times, context_id=context_id)
 
+        frames = []
         for chunk in cached.audio_chunks:
             frame = TTSAudioRawFrame(
                 audio=chunk.audio,
@@ -228,6 +229,20 @@ class TTSCacheMixin:
                 context_id=context_id,
             )
             setattr(frame, _CACHE_ORIGIN_ATTR, True)
+            frames.append(frame)
+
+        # Queue the replay when the service has an audio context open, rather than yielding
+        # it here. Yielding emits instantly, while a websocket provider's own audio for an
+        # EARLIER sentence in the same turn is still in flight — so a cached sentence would
+        # be spoken before the live one it follows. The context queue drains in order, which
+        # is the only thing that keeps a mixed turn in sequence.
+        if self.audio_context_available(context_id):
+            for frame in frames:
+                await self.append_to_audio_context(context_id, frame)
+            return
+
+        # No context open (HTTP-style services that yield synchronously): emit directly.
+        for frame in frames:
             yield frame
 
     def _is_from_cache(self, frame: Frame) -> bool:
@@ -302,12 +317,24 @@ class TTSCacheMixin:
         sample_rate = context.audio[0].sample_rate
         num_channels = context.audio[0].num_channels
 
-        if len(context.tasks) == 1:
-            await self._store_task(
-                context.tasks[0], all_audio, sample_rate, num_channels, context.word_timestamps
+        # Only a context holding exactly ONE text is cached. When a turn reuses one context
+        # across several sentences, the captured buffer is their audio concatenated, and
+        # nothing in the frame stream marks where one sentence ends and the next begins:
+        # word timestamps run on the turn clock, which also counts sentences served from
+        # cache and contributes no audio for them. Any split is therefore an estimate, and a
+        # wrong one caches audio that is replayed for the whole TTL. Skipping costs a single
+        # re-synthesis instead. Fixed canned lines — the case this cache exists for — are
+        # spoken as their own context and take this path exactly.
+        if len(context.tasks) > 1:
+            logger.debug(
+                f"Context {context_id} held {len(context.tasks)} texts; "
+                "per-sentence audio cannot be delimited reliably, skipping cache"
             )
-        else:
-            await self._store_split_tasks(context, all_audio, sample_rate, num_channels)
+            return
+
+        await self._store_task(
+            context.tasks[0], all_audio, sample_rate, num_channels, context.word_timestamps
+        )
 
     async def _store_task(
         self,
@@ -321,80 +348,6 @@ class TTSCacheMixin:
         duration = self._audio_duration(audio, sample_rate, num_channels)
         timestamps = [CachedWordTimestamp(word=w, timestamp=t) for w, t in word_timestamps]
         await self._store_response(task, audio, sample_rate, num_channels, timestamps, duration)
-
-    async def _store_split_tasks(
-        self, context: _ContextCapture, all_audio: bytes, sample_rate: int, num_channels: int
-    ) -> None:
-        """Split one audio context across multiple tasks at word boundaries.
-
-        Only possible when word timestamps were emitted and the locally-parsed word
-        count matches the number of timestamps received; otherwise the batch is skipped
-        (the audio cannot be reliably attributed to individual texts).
-        """
-        if not context.word_timestamps:
-            logger.debug(
-                f"Cannot split {len(context.tasks)} cached texts without word "
-                "timestamps, skipping cache"
-            )
-            return
-
-        total_expected = sum(t.word_count for t in context.tasks)
-        actual = len(context.word_timestamps)
-        if total_expected != actual:
-            logger.debug(
-                f"Word count mismatch for context (expected {total_expected}, got "
-                f"{actual}), cannot split reliably, skipping cache"
-            )
-            return
-
-        # Integrity guard: slicing audio by word-timestamp boundaries is only sound when
-        # the timestamps are non-decreasing. If a provider ever emits non-monotonic times
-        # (e.g. a mid-turn cumulative reset), skip the whole batch rather than risk
-        # mis-attributing audio to the wrong sentence (silent corruption -> safe skip).
-        times = [t for _, t in context.word_timestamps]
-        if any(later < earlier for earlier, later in zip(times, times[1:])):
-            logger.debug("Non-monotonic word timestamps for context, skipping split cache")
-            return
-
-        bytes_per_sample = 2 * num_channels  # 16-bit PCM
-        total_duration = self._audio_duration(all_audio, sample_rate, num_channels)
-        word_idx = 0
-
-        for task in context.tasks:
-            task_timestamps = context.word_timestamps[word_idx : word_idx + task.word_count]
-            if not task_timestamps:
-                word_idx += task.word_count
-                continue
-
-            start_time = task_timestamps[0][1]
-            next_idx = word_idx + task.word_count
-            if next_idx < len(context.word_timestamps):
-                end_time = context.word_timestamps[next_idx][1]
-            else:
-                end_time = total_duration
-
-            start_byte = (
-                int(start_time * sample_rate * bytes_per_sample) // bytes_per_sample
-            ) * bytes_per_sample
-            end_byte = (
-                int(end_time * sample_rate * bytes_per_sample) // bytes_per_sample
-            ) * bytes_per_sample
-            start_byte = max(0, start_byte)
-            end_byte = min(len(all_audio), end_byte)
-
-            task_audio = all_audio[start_byte:end_byte]
-            if not task_audio:
-                logger.warning(f"Empty audio slice for '{task.text[:30]}', skipping")
-                word_idx += task.word_count
-                continue
-
-            normalized = [
-                CachedWordTimestamp(word=w, timestamp=t - start_time) for w, t in task_timestamps
-            ]
-            await self._store_response(
-                task, task_audio, sample_rate, num_channels, normalized, end_time - start_time
-            )
-            word_idx += task.word_count
 
     @staticmethod
     def _audio_duration(audio: bytes, sample_rate: int, num_channels: int) -> float:
