@@ -235,7 +235,9 @@ class TTSCacheMixin:
             if hasattr(super(), "add_word_timestamps"):
                 await super().add_word_timestamps(word_times, context_id=context_id)
 
-        frames = []
+        # Yield, as every TTS service does: `tts_process_generator` appends each yielded
+        # frame to this audio context, which is the same queue and the same ordering the
+        # wrapped service's own audio goes through.
         for chunk in cached.audio_chunks:
             frame = TTSAudioRawFrame(
                 audio=chunk.audio,
@@ -244,20 +246,6 @@ class TTSCacheMixin:
                 context_id=context_id,
             )
             setattr(frame, _CACHE_ORIGIN_ATTR, True)
-            frames.append(frame)
-
-        # Queue the replay when the service has an audio context open, rather than yielding
-        # it here. Yielding emits instantly, while a websocket provider's own audio for an
-        # EARLIER sentence in the same turn is still in flight — so a cached sentence would
-        # be spoken before the live one it follows. The context queue drains in order, which
-        # is the only thing that keeps a mixed turn in sequence.
-        if self.audio_context_available(context_id):
-            for frame in frames:
-                await self.append_to_audio_context(context_id, frame)
-            return
-
-        # No context open (HTTP-style services that yield synchronously): emit directly.
-        for frame in frames:
             yield frame
 
     def _is_from_cache(self, frame: Frame) -> bool:
